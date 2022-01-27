@@ -49,6 +49,7 @@ static NSString *AlertSuppressKey = @"moveToApplicationsFolderAlertSuppress";
 static BOOL MoveInProgress = NO;
 
 // Helper functions
+static NSURL *GetOriginalBundleURL(void);
 static NSString *PreferredInstallLocation(BOOL *isUserDirectory);
 static BOOL IsInApplicationsFolder(NSString *path);
 static BOOL IsInDownloadsFolder(NSString *path);
@@ -73,12 +74,12 @@ void PFMoveToApplicationsFolderIfNecessary(void) {
 		});
 		return;
 	}
-	
+
 	// Skip if user suppressed the alert before
 	if ([[NSUserDefaults standardUserDefaults] boolForKey:AlertSuppressKey]) return;
 
 	// Path of the bundle
-	NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+	NSString *bundlePath = GetOriginalBundleURL().path;
 
 	// Check if the bundle is embedded in another application
 	BOOL isNestedApplication = IsApplicationAtPathNested(bundlePath);
@@ -89,7 +90,7 @@ void PFMoveToApplicationsFolderIfNecessary(void) {
 
 	// OK, looks like we'll need to do a move - set the status variable appropriately
 	MoveInProgress = YES;
-	
+
 	// File Manager
 	NSFileManager *fm = [NSFileManager defaultManager];
 
@@ -238,6 +239,49 @@ BOOL PFMoveIsInProgress() {
 
 #pragma mark -
 #pragma mark Helper Functions
+
+/// Gets the real bundle path of the application, not the Translocated one if applicable
+static NSURL *GetOriginalBundleURL(void) {
+
+	NSURL * bundleURL = [NSBundle mainBundle].bundleURL;
+	NSLog(@"%s: Foundation says bundle URL is %@", __FUNCTION__, bundleURL);
+
+	// #define NSAppKitVersionNumber10_11 1404
+	if (floor(NSAppKitVersionNumber) <= 1404) {
+		return bundleURL;
+	}
+
+	void * handle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+	if (handle == NULL) {
+		return bundleURL;
+	}
+
+	bool isTranslocated = false;
+
+	// Get (undocumented?) function symbols for looking up app translocation info
+	// Note: <Security/SecTranslocation.h> was available in the macOS 10.12 beta SDKs but seems to have been removed as of Xcode 8.1
+	Boolean(*mySecTranslocateIsTranslocatedURL)(CFURLRef path, bool *isTranslocated, CFErrorRef * __nullable error) = dlsym(handle, "SecTranslocateIsTranslocatedURL");
+	CFURLRef __nullable(*mySecTranslocateCreateOriginalPathForURL)(CFURLRef translocatedPath, CFErrorRef * __nullable error) = dlsym(handle, "SecTranslocateCreateOriginalPathForURL");
+
+	dlclose(handle);
+
+	if (mySecTranslocateIsTranslocatedURL == NULL || mySecTranslocateCreateOriginalPathForURL == NULL) {
+		NSLog(@"%s: We're running on macOS >= 10.12 but the SecTranslocate functions are not available", __FUNCTION__);
+		return bundleURL;
+	}
+
+	if (mySecTranslocateIsTranslocatedURL((__bridge CFURLRef)bundleURL, &isTranslocated, NULL) && isTranslocated) {
+		CFURLRef originalURL = mySecTranslocateCreateOriginalPathForURL((__bridge CFURLRef)bundleURL, NULL);
+		if (originalURL != NULL) {
+			NSURL * result = CFBridgingRelease(originalURL);
+			NSLog(@"%s: Security says bundle is Translocated from %@", __FUNCTION__, result);
+			return result;
+		}
+	}
+
+	NSLog(@"%s: Translocation not in effect", __FUNCTION__);
+	return bundleURL;
+}
 
 static NSString *PreferredInstallLocation(BOOL *isUserDirectory) {
 	// Return the preferred install location.
@@ -404,7 +448,7 @@ static BOOL Trash(NSString *path) {
 																 tag:NULL];
 	}
 #endif
-	
+
 	// As a last resort try trashing with AppleScript.
 	// This allows us to trash the app in macOS Sierra even when the app is running inside
 	// an app translocation image.
@@ -440,7 +484,7 @@ static BOOL DeleteOrTrash(NSString *path) {
 		// Don't log warning if on Sierra and running inside App Translocation path
 		if ([path rangeOfString:@"/AppTranslocation/"].location == NSNotFound)
 			NSLog(@"WARNING -- Could not delete '%@': %@", path, [error localizedDescription]);
-		
+
 		return Trash(path);
 	}
 }
